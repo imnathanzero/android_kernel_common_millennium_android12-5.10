@@ -1617,6 +1617,7 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
 	unsigned int nr_reclaimed;
 	struct page *page, *next;
 	LIST_HEAD(clean_pages);
+	unsigned int noreclaim_flag;
 
 	list_for_each_entry_safe(page, next, page_list, lru) {
 		if (page_is_file_lru(page) && !PageDirty(page) &&
@@ -1626,8 +1627,16 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
 		}
 	}
 
+	/*
+	 * We should be safe here since we are only dealing with file pages and
+	 * we are not kswapd and therefore cannot write dirty file pages. But
+	 * call memalloc_noreclaim_save() anyway, just in case these conditions
+	 * change in the future.
+	 */
+	noreclaim_flag = memalloc_noreclaim_save();
 	nr_reclaimed = shrink_page_list(&clean_pages, zone->zone_pgdat, &sc,
 					&stat, true);
+	memalloc_noreclaim_restore(noreclaim_flag);
 	list_splice(&clean_pages, page_list);
 	mod_node_page_state(zone->zone_pgdat, NR_ISOLATED_FILE,
 			    -(long)nr_reclaimed);
@@ -2251,6 +2260,7 @@ unsigned long reclaim_pages(struct list_head *page_list)
 	LIST_HEAD(node_page_list);
 	struct reclaim_stat dummy_stat;
 	struct page *page;
+	unsigned int noreclaim_flag;
 	struct scan_control sc = {
 		.gfp_mask = GFP_KERNEL,
 		.priority = DEF_PRIORITY,
@@ -2258,6 +2268,8 @@ unsigned long reclaim_pages(struct list_head *page_list)
 		.may_unmap = 1,
 		.may_swap = 1,
 	};
+
+	noreclaim_flag = memalloc_noreclaim_save();
 
 	while (!list_empty(page_list)) {
 		page = lru_to_page(page_list);
@@ -2294,6 +2306,8 @@ unsigned long reclaim_pages(struct list_head *page_list)
 			putback_lru_page(page);
 		}
 	}
+
+	memalloc_noreclaim_restore(noreclaim_flag);
 
 	return nr_reclaimed;
 }
@@ -6207,6 +6221,16 @@ static bool allow_direct_reclaim(pg_data_t *pgdat)
 	return wmark_ok;
 }
 
+static __always_inline bool task_is_critical(void)
+{
+	char comm[TASK_COMM_LEN];
+	get_task_comm(comm, current);
+
+	return !strncmp(comm, "surfaceflinger", TASK_COMM_LEN) ||
+	       !strncmp(comm, "system_server", TASK_COMM_LEN) ||
+	       !strncmp(comm, "cameraserver", TASK_COMM_LEN);
+}
+
 /*
  * Throttle direct reclaimers if backing storage is backed by the network
  * and the PFMEMALLOC reserve for the preferred node is getting dangerously
@@ -6268,6 +6292,9 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
 
 	/* If no zone was usable by the allocation flags then do not throttle */
 	if (!pgdat)
+		goto out;
+
+	if (task_is_critical())
 		goto out;
 
 	/* Account for the throttling */
